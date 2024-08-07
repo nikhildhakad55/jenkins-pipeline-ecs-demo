@@ -1,68 +1,103 @@
 pipeline {
     agent any
-    environment {
-        AWS_ACCOUNT_ID="<REPLACE WITH ACCOUNT ID>"
-        AWS_DEFAULT_REGION="<REPLACE WITH REGION>"
-	    CLUSTER_NAME="<REPLACE WITH CLUSTER NAME>"
-	    SERVICE_NAME="<REPLACE WITH SERVICE NAME>"
-	    TASK_DEFINITION_NAME="<REPLACE WITH TASK DEFINITION NAME>"
-	    DESIRED_COUNT="1"
-        IMAGE_REPO_NAME="<REPLACE WITH ECR REPO NAME>"
-        //Do not edit the variable IMAGE_TAG. It uses the Jenkins job build ID as a tag for the new image.
-        IMAGE_TAG="${env.BUILD_ID}"
-        //Do not edit REPOSITORY_URI.
-        REPOSITORY_URI = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_DEFAULT_REGION}.amazonaws.com/${IMAGE_REPO_NAME}"
-	    registryCredential = "<REPLACE WITH NAME OF AWS CREDENTIAL>"
-	    JOB_NAME = "<REPLACE WITH JOB NAME>"
-	    TEST_CONTAINER_NAME = "${JOB_NAME}-test-server"
-    
-}
-   
-    stages {
 
-    // Building Docker image
-    stage('Building image') {
-      steps{
-        script {
-          dockerImage = docker.build "${IMAGE_REPO_NAME}:${IMAGE_TAG}"
-        }
-      }
-     }
-    // Run container locally and perform tests
-    stage('Running tests') {
-      steps{
-        sh 'docker run -i --rm --name "${TEST_CONTAINER_NAME}" "${IMAGE_REPO_NAME}:${IMAGE_TAG}" npm test -- --watchAll=false'
-      }
+    environment {
+        ECR_REGISTRY = 'account id .dkr.ecr.eu-west-1.amazonaws.com'
+        ECR_REPOSITORY = 'give ecr name'
+        AWS_DEFAULT_REGION = 'give region name'
+        DOCKER_IMAGE = "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+        ECS_CLUSTER = 'give name'
+        ECS_SERVICE = 'give name'
+        ECS_TASK_DEFINITION_FAMILY = 'give name'
     }
 
-    // Uploading Docker image into AWS ECR
-    stage('Releasing') {
-     steps{  
-         script {
-			docker.withRegistry("https://" + REPOSITORY_URI, "ecr:${AWS_DEFAULT_REGION}:" + registryCredential) {
-                    	dockerImage.push()
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git url: 'https://github.com/nikhildhakad55/jenkins-pipeline-ecs-demo.git', branch: 'main'
             }
-         }
-       }
-     }
+        }
 
-    // Update task definition and service running in ECS cluster to deploy
-    stage('Deploy') {
-     steps{
-            withAWS(credentials: registryCredential, region: "${AWS_DEFAULT_REGION}") {
+        stage('Build Docker Image') {
+            steps {
                 script {
-			sh "chmod +x -R ${env.WORKSPACE}"
-			sh './script.sh'
+                    sh "docker build -t ${DOCKER_IMAGE} ."
                 }
-            } 
-         }
-       }
-     }
-   // Clear local image registry. Note that all the data that was used to build the image is being cleared.
-   // For different use cases, one may not want to clear all this data so it doesn't have to be pulled again for each build.
-   post {
-       always {
-       sh 'docker system prune -a -f'
-     }
-   }
- }
+            }
+        }
+
+        stage('Login to AWS ECR') {
+            steps {
+                withCredentials([aws(credentialsId: 'credential id of aws', region: "${AWS_DEFAULT_REGION}")]) {
+                    script {
+                        sh "aws ecr get-login-password --region ${AWS_DEFAULT_REGION} | docker login --username AWS --password-stdin ${ECR_REGISTRY}"
+                    }
+                }
+            }
+        }
+
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    sh "docker push ${DOCKER_IMAGE}"
+                }
+            }
+        }
+
+        stage('Update ECS Task Definition') {
+            steps {
+                withCredentials([aws(credentialsId: 'credential id of aws', region: "${AWS_DEFAULT_REGION}")]) {
+                    script {
+                        // Fetch the current task definition JSON
+                        def taskDefinition = sh(script: "aws ecs describe-task-definition --task-definition ${ECS_TASK_DEFINITION_FAMILY} --query 'taskDefinition' --output json", returnStdout: true).trim()
+
+                        // Use jq to filter out unsupported fields
+                        sh """
+                        echo '${taskDefinition}' | jq '
+                        {
+                            family: .family,
+                            taskRoleArn: .taskRoleArn,
+                            executionRoleArn: .executionRoleArn,
+                            networkMode: .networkMode,
+                            containerDefinitions: .containerDefinitions,
+                            volumes: .volumes,
+                            placementConstraints: .placementConstraints,
+                            requiresCompatibilities: .requiresCompatibilities,
+                            cpu: .cpu,
+                            memory: .memory
+                        }' > updated-task-definition.json
+                        """
+
+                        // Update image field
+                        sh "jq '.containerDefinitions[0].image = \"${DOCKER_IMAGE}\"' updated-task-definition.json > new-task-definition.json"
+
+                        // Register the new task definition
+                        sh "aws ecs register-task-definition --cli-input-json file://new-task-definition.json"
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to ECS') {
+            steps {
+                withCredentials([aws(credentialsId: 'credential id of aws ', region: "${AWS_DEFAULT_REGION}")]) {
+                    script {
+                        sh "aws ecs update-service --cluster ${ECS_CLUSTER} --service ${ECS_SERVICE} --force-new-deployment"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh "docker system prune -af"
+        }
+        success {
+            echo 'Deployment successful!'
+        }
+        failure {
+            echo 'Deployment failed.'
+        }
+    }
+}
